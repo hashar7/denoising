@@ -1,79 +1,83 @@
-# -------------------------
-# Patching & batched inference (memory-safe)
-# -------------------------
-def extract_patches(image, ph, pw, stride_h, stride_w):
-    H, W = image.shape
-    pad_h = (ph - (H % ph)) % ph
-    pad_w = (pw - (W % pw)) % pw
-    image_padded = np.pad(image, ((0, pad_h), (0, pad_w)), mode='reflect') if (pad_h or pad_w) else image.copy()
-    Hp, Wp = image_padded.shape
-    ys = list(range(0, Hp - ph + 1, stride_h))
-    xs = list(range(0, Wp - pw + 1, stride_w))
-    if ys[-1] != Hp - ph:
-        ys.append(Hp - ph)
-    if xs[-1] != Wp - pw:
-        xs.append(Wp - pw)
-    coords = []
-    for y in ys:
-        for x in xs:
-            coords.append((y, x))
-    return image_padded, coords
+import numpy as np
+from scipy import ndimage
+from skimage.filters import sobel
+from skimage.metrics import structural_similarity as ssim
 
-def batched_patch_inference(image, model, ph, pw, stride_h, stride_w, device, batch_size=2):
-    model.eval()
-    win = make_hanning_window(ph, pw)
-    image_padded, coords = extract_patches(image, ph, pw, stride_h, stride_w)
-    Hp, Wp = image_padded.shape
-    output = np.zeros_like(image_padded, dtype=np.float32)
-    weight = np.zeros_like(image_padded, dtype=np.float32)
+def evaluate_denoising(I: np.ndarray, D: np.ndarray, eps: float = 1e-10) -> dict:
+    """
+    I : original/noisy image (2D numpy array)
+    D : denoised image (2D numpy array)
 
-    num = len(coords)
-    idx = 0
-    with torch.no_grad():
-        while idx < num:
-            bs = min(batch_size, num - idx)
-            inp_list = []
-            means = []
-            stds = []
-            for j in range(bs):
-                y, x = coords[idx + j]
-                patch = image_padded[y:y+ph, x:x+pw].astype(np.float32)
-                m = patch.mean(); s = patch.std() if patch.std() > 1e-6 else 1.0
-                pn = (patch - m) / s
-                inp_list.append(pn)
-                means.append(m); stds.append(s)
-            inp_batch = np.stack(inp_list, axis=0)[:, None, :, :]  # (B,1,H,W)
-            inp_t = torch.from_numpy(inp_batch).to(device).float()
-            if USE_AMP and device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    out = model(inp_t)
-            else:
-                out = model(inp_t)
-            out_np = out.detach().cpu().numpy()[:, 0, :, :]  # (B,H,W)
-            # accumulate
-            for j in range(bs):
-                y, x = coords[idx + j]
-                patch_out = out_np[j] * stds[j] + means[j]
-                output[y:y+ph, x:x+pw] += patch_out * win
-                weight[y:y+ph, x:x+pw] += win
-            idx += bs
+    Returns dictionary with:
+    - Noise Reduction Rate
+    - ENL increase
+    - Residual mean
+    - Edge Preservation Index (EPI)
+    - High Frequency Energy Ratio
+    - Structure in residual (SSIM)
+    - Histogram similarity
+    """
 
-    H, W = image.shape
-    denoised = output[:H, :W] / (weight[:H, :W] + 1e-8)
-    return denoised
+    I = I.astype(np.float64)
+    D = D.astype(np.float64)
 
-# -------------------------
-# No-GT evaluation helpers
-# -------------------------
-def noise_reduction_rate(I, D):
-    return 1 - (np.var(D) / (np.var(I) + 1e-12))
+    residual = I - D
 
-def edge_preservation_index(I, D):
-    from scipy import ndimage
-    sx = ndimage.sobel(I, axis=1)
-    sy = ndimage.sobel(I, axis=0)
-    sI = np.hypot(sx, sy)
-    sx2 = ndimage.sobel(D, axis=1)
-    sy2 = ndimage.sobel(D, axis=0)
-    sD = np.hypot(sx2, sy2)
-    return sD.sum() / (sI.sum() + 1e-12)
+    # --- 1. Noise Reduction Rate
+    var_I = np.var(I)
+    var_R = np.var(residual)
+    nrr = 1 - (var_R / (var_I + eps))
+
+    # --- 2. Equivalent Number of Looks (ENL)
+    def enl(im):
+        m = np.mean(im)
+        v = np.var(im)
+        return (m ** 2) / (v + eps)
+
+    enl_I = enl(I)
+    enl_D = enl(D)
+    enl_increase = (enl_D - enl_I) / (enl_I + eps)
+
+    # --- 3. Residual mean
+    residual_mean = np.mean(residual)
+
+    # --- 4. Edge Preservation Index (correlation of Sobel edges)
+    G_I = sobel(I)
+    G_D = sobel(D)
+
+    epi_num = np.sum((G_I - G_I.mean()) * (G_D - G_D.mean()))
+    epi_den = np.sqrt(np.sum((G_I - G_I.mean())**2) * np.sum((G_D - G_D.mean())**2)) + eps
+    epi = epi_num / epi_den
+
+    # --- 5. High Frequency Energy ratio
+    def high_freq_energy(im):
+        low = ndimage.gaussian_filter(im, sigma=2)
+        high = im - low
+        return np.sum(high ** 2)
+
+    hf_I = high_freq_energy(I)
+    hf_D = high_freq_energy(D)
+
+    hf_ratio = hf_D / (hf_I + eps)
+
+    # --- 6. Structural content in residual (SSIM)
+    h, w = residual.shape
+    ssim_residual = ssim(residual, np.zeros((h, w)), data_range=residual.max() - residual.min())
+
+    # --- 7. Histogram similarity (correlation)
+    hI, _ = np.histogram(I.flatten(), bins=256, range=(0, 255), density=True)
+    hD, _ = np.histogram(D.flatten(), bins=256, range=(0, 255), density=True)
+
+    hist_corr = np.corrcoef(hI, hD)[0, 1]
+
+    return {
+        "Noise reduction rate (ideal 0.4–0.85)": round(float(nrr), 4),
+        "ENL original": round(float(enl_I), 3),
+        "ENL denoised": round(float(enl_D), 3),
+        "ENL relative increase (ideal > 1.0)": round(float(enl_increase), 4),
+        "Residual mean (ideal ≈ 0)": round(float(residual_mean), 6),
+        "Edge preservation index (ideal 0.8–1.05)": round(float(epi), 4),
+        "HF energy ratio (ideal 0.3–0.7)": round(float(hf_ratio), 4),
+        "Residual structure SSIM (ideal ≈ 0)": round(float(ssim_residual), 6),
+        "Histogram similarity (ideal > 0.9)": round(float(hist_corr), 4),
+    }
